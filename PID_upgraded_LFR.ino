@@ -1,16 +1,16 @@
 /*
- * High-Performance PID Line Follower (Using MotorDriver.h)
+ * High-Performance PID Line Followe
  * ===============================================================
  *
  * Description:
- * This code implements a faster, more responsive PID algorithm. It's
- * designed for higher speeds and better cornering by using more
- * aggressive error correction and allowing motors to reverse for
- * sharp point-turns. It uses the MotorDriver.h library.
+ * This version features a "one-spin" autonomous calibration that runs
+ * automatically every time the robot is powered on. It does not save
+ * the calibration value to permanent memory. This version is tuned
+ * for better performance on sharp 90-degree turns.
  *
  * Hardware Requirements:
  * 1. Arduino Uno R3 Board
- * 2. L293D Motor Driver Shield (that works with MotorDriver.h)
+ * 2. L293D Motor Driver Shield
  * 3. 2x N20 DC Motors
  * 4. 8-Channel Analog IR Sensor Array
  * 5. External Power Supply for motors
@@ -22,14 +22,14 @@
  *
  * Sensor Array Connection:
  * - S1 (Leftmost) -> Arduino Digital Pin 2
- * - S8 (Rightmost) -> Arduino Digital Pin 13  // *** MOVED from Pin 4 to avoid conflict ***
+ * - S8 (Rightmost) -> Arduino Digital Pin 13
  * - S2 -> A0, S3 -> A1, S4 -> A2, S5 -> A3, S6 -> A4, S7 -> A5
  *
  * Library Requirement:
  * You must have the "MotorDriver.h" library installed.
  *
- * Author: Veteran Line Follower Maker
- * Version: 3.1 (Pin conflict fix)
+ * Author: ded
+ * Version: 4.1 (90-Degree Turn Enhancement)
  */
 
 // --- LIBRARIES ---
@@ -39,26 +39,28 @@
 MotorDriver m; // Create a motor driver object
 
 // --- PID CONTROL CONSTANTS (NEEDS RE-TUNING) ---
-// These values are a starting point for the new algorithm.
-// You will need to re-tune them for optimal performance.
-double Kp = 0.07;
-double Ki = 0.00005;
-double Kd = 0.4;
+// *** MODIFIED: More aggressive values for sharper turns. ***
+double Kp = 0.09;     // Increased Kp for a stronger, faster reaction to error.
+double Ki = 0.00005;  // Ki remains small to prevent overshoot on straights.
+double Kd = 0.5;      // Increased Kd to dampen the stronger Kp and reduce oscillation.
 
 // --- ROBOT PARAMETERS ---
-const int MAX_SPEED = 255; // Allow full speed
-const int BASE_SPEED = 180; // A higher base speed
+const int MAX_SPEED = 255;
+// *** NOTE: If still failing turns, try reducing BASE_SPEED to 150 or 160. ***
+const int BASE_SPEED = 180;
+const int CALIBRATION_SPEED = 150; // Speed for rotation/movement during calibration
 
 // --- SENSOR AND ERROR CALCULATION ---
 const int NUM_SENSORS = 8;
 const int NUM_ANALOG_SENSORS = 6;
-const int SENSOR_MAX_ERROR = 4000; // Max error value when line is lost
+// *** MODIFIED: Increased max error for a more decisive turn when the line is lost. ***
+const int SENSOR_MAX_ERROR = 5000;
 
 int analogSensorPins[NUM_ANALOG_SENSORS] = {A0, A1, A2, A3, A4, A5};
-// *** MODIFIED to use Pin 13 for the rightmost sensor ***
 int digitalSensorPins[] = {2, 13}; // S1 -> D2, S8 -> D13
 int sensorValues[NUM_SENSORS];
 
+// This value is set by the mandatory calibration routine on startup.
 int sensorThreshold = 500;
 
 // --- PID CALCULATION VARIABLES ---
@@ -67,18 +69,21 @@ double previousError = 0;
 double integral = 0;
 double derivative = 0;
 double pidValue = 0;
-
-// Anti-windup for the integral term
 const double INTEGRAL_MAX = 5000;
 
 void setup() {
-  // Set the digital sensor pins to INPUT
   pinMode(digitalSensorPins[0], INPUT);
   pinMode(digitalSensorPins[1], INPUT);
-
   Serial.begin(9600);
-  delay(2000);
+  delay(1000);
+
+  // Always run the autonomous calibration routine on every startup.
+  calibrateSensors();
+
   Serial.println("Starting High-Performance PID Follower...");
+  Serial.print("Using newly calibrated Sensor Threshold: ");
+  Serial.println(sensorThreshold);
+  delay(2000); // Give user time to let go of the robot.
 }
 
 void loop() {
@@ -86,103 +91,120 @@ void loop() {
   calculateError();
   calculatePID();
   controlMotors();
-  printDebugInfo(); // Uncomment for tuning
+  // printDebugInfo(); // Uncomment for tuning PID constants
 }
+
+// --- AUTONOMOUS CALIBRATION FUNCTION ---
+/**
+ * @brief An autonomous routine that runs on every startup. The robot
+ * rotates 360 degrees to find the min (black) and max (white)
+ * sensor values to set the threshold.
+ */
+void calibrateSensors() {
+  Serial.println("--- One-Spin Autonomous Calibration ---");
+  Serial.println("Place robot ON the BLACK line now.");
+  Serial.println("Calibration will start in 5 seconds...");
+  delay(5000);
+
+  // --- Calibrate by rotating and finding min/max values ---
+  Serial.println("Scanning... Rotating 360 degrees.");
+  
+  int minReading = 1023; // Will hold the low value (black)
+  int maxReading = 0;    // Will hold the high value (white)
+
+  m.motor(3, FORWARD, CALIBRATION_SPEED);
+  m.motor(4, BACKWARD, CALIBRATION_SPEED);
+
+  // Rotate for a set duration to complete a ~360 degree turn.
+  // Adjust the loop count (150) if the robot over or under-rotates.
+  for(int i = 0; i < 150; i++){
+    for (int j = 0; j < NUM_ANALOG_SENSORS; j++) {
+      int currentReading = analogRead(analogSensorPins[j]);
+      if (currentReading < minReading) {
+        minReading = currentReading;
+      }
+      if (currentReading > maxReading) {
+        maxReading = currentReading;
+      }
+    }
+    delay(10);
+  }
+
+  // Stop the motors
+  m.motor(3, BRAKE, 0);
+  m.motor(4, BRAKE, 0);
+
+  // Calculate and assign the new threshold directly to the global variable
+  sensorThreshold = (minReading + maxReading) / 2;
+  
+  Serial.println("\n--- CALIBRATION COMPLETE ---");
+  Serial.print("Min (Black) Reading: ");
+  Serial.println(minReading);
+  Serial.print("Max (White) Reading: ");
+  Serial.println(maxReading);
+  Serial.print("New threshold calculated and set: ");
+  Serial.println(sensorThreshold);
+  delay(1000);
+}
+
 
 // --- CORE FUNCTIONS ---
 
-/**
- * @brief Reads all 8 sensors using a hybrid analog/digital approach.
- */
 void readSensors() {
-  // Read the leftmost digital sensor (S1)
-  sensorValues[0] = (digitalRead(digitalSensorPins[0]) == LOW) ? 1023 : 0;
-
-  // Read the 6 middle analog sensors (S2-S7)
+  // Logic for inverted sensors (white is high, black is low)
+  sensorValues[0] = (digitalRead(digitalSensorPins[0]) == HIGH) ? 0 : 1023;
   for (int i = 0; i < NUM_ANALOG_SENSORS; i++) {
     sensorValues[i + 1] = analogRead(analogSensorPins[i]);
   }
-
-  // Read the rightmost digital sensor (S8)
-  sensorValues[7] = (digitalRead(digitalSensorPins[1]) == LOW) ? 1023 : 0;
+  sensorValues[7] = (digitalRead(digitalSensorPins[1]) == HIGH) ? 0 : 1023;
 }
 
-/**
- * @brief Calculates a weighted average for all 8 sensors.
- * This version uses a more aggressive error value when the line is lost.
- */
 void calculateError() {
   long weightedSum = 0;
   int numActiveSensors = 0;
   bool onLine = false;
 
   for (int i = 0; i < NUM_SENSORS; i++) {
-    if (sensorValues[i] > sensorThreshold) {
+    // Logic for inverted sensors (lower reading means on the black line)
+    if (sensorValues[i] < sensorThreshold) {
       onLine = true;
       numActiveSensors++;
-      // Weights for 8 sensors: -3500, -2500, -1500, -500, 500, 1500, 2500, 3500
       weightedSum += (long)(i - (NUM_SENSORS - 1) / 2.0) * 1000;
     }
   }
 
   if (!onLine) {
-    // If the line is lost, make a hard turn based on the last known position.
-    if (previousError > 0) { // Was on the right side of the line
-      error = SENSOR_MAX_ERROR;
-    } else { // Was on the left side of the line
-      error = -SENSOR_MAX_ERROR;
-    }
+    error = (previousError > 0) ? SENSOR_MAX_ERROR : -SENSOR_MAX_ERROR;
   } else {
     error = (double)weightedSum / numActiveSensors;
   }
 }
 
-/**
- * @brief Computes the PID output value with integral windup protection.
- */
 void calculatePID() {
   integral += error;
-
-  // Prevent integral windup: clamp the integral term to a max/min value.
   integral = constrain(integral, -INTEGRAL_MAX, INTEGRAL_MAX);
-  
   derivative = error - previousError;
   pidValue = (Kp * error) + (Ki * integral) + (Kd * derivative);
   previousError = error;
 }
 
-/**
- * @brief Sets the speed of the motors. This version allows one motor to go
- * in reverse for extremely sharp, agile turns.
- */
 void controlMotors() {
   double leftMotorSpeed = BASE_SPEED - pidValue;
   double rightMotorSpeed = BASE_SPEED + pidValue;
 
-  // --- Left Motor Control (M3) ---
   if (leftMotorSpeed >= 0) {
-    // Move forward
     m.motor(3, FORWARD, constrain(leftMotorSpeed, 0, MAX_SPEED));
   } else {
-    // Move backward for sharp turns
     m.motor(3, BACKWARD, constrain(abs(leftMotorSpeed), 0, MAX_SPEED));
   }
 
-  // --- Right Motor Control (M4) ---
   if (rightMotorSpeed >= 0) {
-    // Move forward
     m.motor(4, FORWARD, constrain(rightMotorSpeed, 0, MAX_SPEED));
   } else {
-    // Move backward for sharp turns
     m.motor(4, BACKWARD, constrain(abs(rightMotorSpeed), 0, MAX_SPEED));
   }
 }
 
-// --- HELPER AND DEBUGGING FUNCTIONS ---
-
-/**
- * @brief Prints PID variables to the serial monitor for debugging.
- */
 void printDebugInfo() {
   Serial.print("Error: ");
   Serial.print(error);
@@ -193,3 +215,4 @@ void printDebugInfo() {
   Serial.print("\tR_Spd: ");
   Serial.println(BASE_SPEED + pidValue);
 }
+

@@ -1,0 +1,440 @@
+// ===================================================================================
+// Technoxian WRC - High-Performance PID Line Follower (v19.3 - Stability Tuning)
+// -----------------------------------------------------------------------------------
+// By ded
+// - Optimized for RLS 08 Array, Wing Sensors, and Lookahead
+//
+// ===================================================================================
+
+#include <MotorDriver.h>
+#include <EEPROM.h>
+
+// ----------------- HARDWARE & PINS -----------------
+#define DEBUG_MODE true // Set to false for competition to disable Serial prints
+
+// Motor Configuration
+const bool INVERT_LEFT_MOTOR  = false;
+const bool INVERT_RIGHT_MOTOR = false;
+MotorDriver m;
+
+// Pin Definitions
+const int SWITCH_PIN = 22;
+const int SENSOR_PINS[] = {A13, A0, A1, A2, A3, A14, A4, A8, A9, A12, A15}; // 0=LeftWing, 5=Lookahead, 10=RightWing
+const int NUM_SENSORS = 11;
+const int LOOKAHEAD_PIN = A14; // Assuming A14 is your lookahead sensor from the array
+
+// ----------------- SPEED & PERFORMANCE PROFILE -----------------
+const int MAX_SPEED       = 255; // Absolute maximum speed
+const int BASE_SPEED      = 230; // TUNING: Lowered for stability. Increase this once stable.
+const int MIN_SPEED       = 130;  // Minimum speed during gentle turns
+const int TURN_SPEED      = 160; // Speed for sharp 90-degree turns
+const int RECOVERY_SPEED  = 120;
+
+// ----------------- PID CONTROL CONSTANTS (CRITICAL TUNING) -----------------
+// Start with these and fine-tune.
+// Kp: Primary steering force. Increase for sharper turns, decrease if wobbly.
+// Kd: Damping force. Increase to reduce overshooting, decrease if sluggish.
+// Ki: Error correction over time. Keep low; mainly for long, gentle curves.
+double Kp_base = 1.0;   // TUNING: Reduced to fix wobbling on straights.
+double Kp_turn = 2.7;   // TUNING: Reduced for less aggressive turns.
+double Ki = 0.0000;      // Integral gain (use cautiously, keep it low).
+double Kd = 10.0;       // TUNING: Increased significantly to prevent overshooting.
+const int SETPOINT = 4500; // Target sensor value (middle of the inner 9 sensors)
+
+// ----------------- SENSOR & LINE DETECTION -----------------
+const int SENSOR_WEIGHTS[] = {0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000}; // For the 9 main sensors
+const int LINE_THRESHOLD = 600; // Calibrated value threshold to consider a sensor "on the line"
+const int WING_THRESHOLD = 700; // Higher threshold for wing sensors to confirm a sharp turn
+const int LOOKAHEAD_THRESHOLD = 500; // Threshold for lookahead to detect an upcoming line/turn
+const int INTERSECTION_MIN_SENSORS = 5; // Min number of sensors to trigger intersection logic
+
+// ----------------- STATE & TIMING -----------------
+enum RobotState { FOLLOWING, GENTLE_TURN, SHARP_TURN, INTERSECTION, RECOVERY };
+RobotState currentState = FOLLOWING;
+
+unsigned long lastLineSeenTime = 0;
+const unsigned long LINE_LOST_TIMEOUT = 250; // ms before entering recovery
+unsigned long intersectionCooldownTimer = 0;
+const unsigned long INTERSECTION_COOLDOWN = 300; // ms to ignore intersections after one is crossed
+
+// ----------------- GLOBAL VARIABLES -----------------
+unsigned int sensorMin[NUM_SENSORS];
+unsigned int sensorMax[NUM_SENSORS];
+double error = 0, lastError = 0, integral = 0, derivative = 0;
+bool isRunning = false;
+
+// ----------------- FUNCTION PROTOTYPES -----------------
+void handleSwitch();
+void calibrateSensors();
+void stopMotors();
+void runMotor(int motor, int speed);
+int readLinePosition(bool &lineFound, bool &isIntersection, bool &leftWingActive, bool &rightWingActive);
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  for (int i = 0; i < NUM_SENSORS; i++) pinMode(SENSOR_PINS[i], INPUT);
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
+
+  // Initialize sensor calibration arrays
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    sensorMin[i] = 1023;
+    sensorMax[i] = 0;
+  }
+
+  // Load calibration from EEPROM if it exists
+  if (EEPROM.read(0) == 'C') { // Use a character 'C' as a validity check
+    EEPROM.get(1, sensorMin);
+    EEPROM.get(1 + sizeof(sensorMin), sensorMax);
+    if (DEBUG_MODE) Serial.println("Calibration loaded from EEPROM.");
+  } else {
+    if (DEBUG_MODE) Serial.println("No calibration found. Please calibrate.");
+  }
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+  handleSwitch();
+
+  if (!isRunning) {
+    stopMotors();
+    return;
+  }
+
+  // --- Read Sensors ---
+  bool lineFound, isIntersection, leftWingActive, rightWingActive;
+  int position = readLinePosition(lineFound, isIntersection, leftWingActive, rightWingActive);
+  int lookaheadValue = 1023 - constrain(map(analogRead(LOOKAHEAD_PIN), sensorMin[5], sensorMax[5], 0, 1000), 0, 1000);
+
+  // --- State Transitions ---
+  if (!lineFound) {
+    if (millis() - lastLineSeenTime > LINE_LOST_TIMEOUT) {
+      currentState = RECOVERY;
+    }
+    // If line is briefly lost, hold last state and rely on recovery/lastError
+  } else {
+    lastLineSeenTime = millis();
+    if (isIntersection && (millis() - intersectionCooldownTimer > INTERSECTION_COOLDOWN)) {
+      currentState = INTERSECTION;
+    } else if (leftWingActive || rightWingActive) {
+      currentState = SHARP_TURN;
+    } else if (abs(position - SETPOINT) > 1500) { // If error is significant, it's a gentle turn
+      currentState = GENTLE_TURN;
+    } else {
+      currentState = FOLLOWING; // Default state
+    }
+  }
+
+  // --- State Machine Logic ---
+  switch (currentState) {
+    case FOLLOWING: {
+      error = position - SETPOINT;
+      double currentKp = Kp_base;
+      
+      integral += error;
+      integral = constrain(integral, -5000, 5000);
+      derivative = error - lastError;
+
+      double pidCorrection = (currentKp * error) + (Ki * integral) + (Kd * derivative);
+
+      // S-Curve Speed Control: Slow down slightly for minor corrections
+      double errorFraction = abs(error) / (double)SETPOINT;
+      int speed = BASE_SPEED - (int)(errorFraction * (BASE_SPEED - MIN_SPEED));
+
+      // Predictive Braking: Slow down if lookahead sees a line
+      if (lookaheadValue > LOOKAHEAD_THRESHOLD) {
+        speed = MIN_SPEED;
+      }
+      
+      runMotor(1, speed + pidCorrection);
+      runMotor(2, speed - pidCorrection);
+      break;
+    }
+
+    case GENTLE_TURN: {
+      error = position - SETPOINT;
+      double currentKp = Kp_turn;
+
+      // Reset integral in turns to prevent windup
+      integral = 0;
+      derivative = error - lastError;
+
+      double pidCorrection = (currentKp * error) + (Kd * derivative);
+
+      // Slow down to a consistent turning speed for predictability
+      int speed = TURN_SPEED;
+
+      runMotor(1, speed + pidCorrection);
+      runMotor(2, speed - pidCorrection);
+      break;
+    }
+
+    case SHARP_TURN: {
+      // For 90-degree turns, pivot on the spot or make a tight arc
+      if (leftWingActive) {
+        runMotor(1, -TURN_SPEED);
+        runMotor(2, TURN_SPEED);
+      } else if (rightWingActive) {
+        runMotor(1, TURN_SPEED);
+        runMotor(2, -TURN_SPEED);
+      }
+      // Reset PID terms after a sharp turn
+      integral = 0;
+      lastError = 0;
+      break;
+    }
+
+    case INTERSECTION: {
+      // Drive straight for a fixed duration to clear the intersection
+      runMotor(1, BASE_SPEED);
+      runMotor(2, BASE_SPEED);
+      delay(100); // Adjust this delay based on robot speed and intersection size
+      intersectionCooldownTimer = millis();
+      currentState = FOLLOWING; // Transition back to following
+      integral = 0; // Reset integral to prevent sudden jerks
+      break;
+    }
+
+    case RECOVERY: {
+      // If line is lost, turn in the direction it was last seen
+      if (lastError < 0) { // Line was to the left
+        runMotor(1, -RECOVERY_SPEED);
+        runMotor(2, RECOVERY_SPEED);
+      } else { // Line was to the right
+        runMotor(1, RECOVERY_SPEED);
+        runMotor(2, -RECOVERY_SPEED);
+      }
+      // If line is not found after a short sweep, you might implement a spiral search
+      break;
+    }
+  }
+
+  lastError = error; // Update lastError for the next loop
+
+  if (DEBUG_MODE) {
+    Serial.print("State: "); Serial.print(currentState);
+    Serial.print(" | Pos: "); Serial.print(position);
+    Serial.print(" | Err: "); Serial.print(error);
+    Serial.print(" | LKAHD: "); Serial.println(lookaheadValue);
+  }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Reads all sensors, calculates the weighted average position of the line.
+ * @param lineFound Set to true if the line is detected under the main sensor array.
+ * @param isIntersection Set to true if multiple sensors detect the line.
+ * @param leftWingActive Set to true if the left wing sensor is on the line.
+ * @param rightWingActive Set to true if the right wing sensor is on the line.
+ * @return The calculated line position (0-9000). Returns last known direction if line is lost.
+ */
+int readLinePosition(bool &lineFound, bool &isIntersection, bool &leftWingActive, bool &rightWingActive) {
+  unsigned long weightedSum = 0;
+  unsigned int sum = 0;
+  unsigned int calibratedValues[NUM_SENSORS];
+  int activeSensorCount = 0;
+  lineFound = false;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int rawValue = analogRead(SENSOR_PINS[i]);
+    // Map the raw value to a 0-1000 scale, where 1000 is directly on the line
+    calibratedValues[i] = constrain(map(rawValue, sensorMin[i], sensorMax[i], 1000, 0), 0, 1000);
+
+    if (calibratedValues[i] > LINE_THRESHOLD) {
+      // Consider only the 9 inner sensors for line position and intersection detection
+      if (i > 0 && i < NUM_SENSORS - 1) {
+        activeSensorCount++;
+      }
+    }
+  }
+
+  // Check wing sensors separately
+  leftWingActive = calibratedValues[0] > WING_THRESHOLD;
+  rightWingActive = calibratedValues[NUM_SENSORS - 1] > WING_THRESHOLD;
+
+  // Calculate weighted average for the 9 inner sensors (index 1 to 9)
+  for (int i = 1; i < NUM_SENSORS - 1; i++) {
+    if (calibratedValues[i] > 200) { // Use a lower threshold for weighting to get smoother results
+      weightedSum += (unsigned long)calibratedValues[i] * SENSOR_WEIGHTS[i];
+      sum += calibratedValues[i];
+    }
+  }
+
+  if (sum > 0) {
+    lineFound = true;
+  }
+
+  isIntersection = activeSensorCount >= INTERSECTION_MIN_SENSORS;
+
+  if (!lineFound) {
+    // If line is lost, return the extreme value based on the last known direction
+    return (lastError < 0) ? 0 : 9000;
+  }
+
+  return weightedSum / sum;
+}
+
+
+/**
+ * @brief Handles start/stop and calibration with robust debouncing and action cooldown.
+ * Short press: Toggles running state.
+ * Long press (2s): Starts sensor calibration.
+ */
+void handleSwitch() {
+  // Debouncing variables
+  static int lastSteadyState = HIGH;
+  static int lastFlickerState = HIGH;
+  static unsigned long lastDebounceTime = 0;
+  const unsigned long debounceDelay = 50;
+
+  // Long press variables
+  static unsigned long pressStartTime = 0;
+  static bool longPressHandled = false;
+  
+  // Cooldown to prevent rapid toggling
+  static unsigned long lastActionTime = 0;
+  const unsigned long actionCooldown = 500; // Ignore new actions for 0.5 seconds
+
+  int reading = digitalRead(SWITCH_PIN);
+
+  // If the switch signal has changed, reset the debouncing timer
+  if (reading != lastFlickerState) {
+    lastDebounceTime = millis();
+  }
+
+  // After the signal has been stable for longer than the debounce delay...
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // ...if the stable state has changed...
+    if (reading != lastSteadyState) {
+      lastSteadyState = reading;
+
+      // Handle the button press (transition from HIGH to LOW)
+      if (lastSteadyState == LOW) {
+        pressStartTime = millis();
+        longPressHandled = false;
+      }
+      // Handle the button release (transition from LOW to HIGH)
+      else {
+        // Check if it was a short press and if we are outside the cooldown period
+        if (!longPressHandled && (millis() - lastActionTime > actionCooldown)) { 
+          isRunning = !isRunning;
+          lastActionTime = millis(); // Record the time of this action to start cooldown
+          
+          if (isRunning) {
+            currentState = FOLLOWING;
+            integral = 0;
+            lastError = 0;
+            error = 0;
+            if (DEBUG_MODE) Serial.println("SHORT PRESS: BOT STARTED");
+          } else {
+            if (DEBUG_MODE) Serial.println("SHORT PRESS: BOT STOPPED");
+          }
+        }
+      }
+    }
+  }
+  
+  // Check for a long press while the button is held down
+  if (lastSteadyState == LOW && !longPressHandled && (millis() - pressStartTime > 2000)) {
+    // Check if we are outside the cooldown period
+    if (millis() - lastActionTime > actionCooldown) {
+      isRunning = false;
+      stopMotors();
+      if (DEBUG_MODE) Serial.println("LONG PRESS: CALIBRATION START");
+      calibrateSensors();
+      longPressHandled = true; // Mark long press as handled
+      lastActionTime = millis(); // Start cooldown after the long press action
+    }
+  }
+
+  lastFlickerState = reading;
+}
+
+
+/**
+ * @brief Calibrates the sensors by spinning left and right over the line.
+ * Stores the min/max values in global arrays and saves them to EEPROM.
+ */
+void calibrateSensors() {
+  // Indicate calibration start (e.g., with an LED if you have one)
+  
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    sensorMin[i] = 1023;
+    sensorMax[i] = 0;
+  }
+
+  // Spin right
+  runMotor(1, 180);
+  runMotor(2, -180);
+  for(int i=0; i<150; i++){
+    for (int j = 0; j < NUM_SENSORS; j++) {
+      int val = analogRead(SENSOR_PINS[j]);
+      if (val < sensorMin[j]) sensorMin[j] = val;
+      if (val > sensorMax[j]) sensorMax[j] = val;
+    }
+    delay(20);
+  }
+
+  // Spin left
+  runMotor(1, -180);
+  runMotor(2, 180);
+  for(int i=0; i<150; i++){
+    for (int j = 0; j < NUM_SENSORS; j++) {
+      int val = analogRead(SENSOR_PINS[j]);
+      if (val < sensorMin[j]) sensorMin[j] = val;
+      if (val > sensorMax[j]) sensorMax[j] = val;
+    }
+    delay(20);
+  }
+
+  stopMotors();
+
+  // Save to EEPROM
+  EEPROM.write(0, 'C');
+  EEPROM.put(1, sensorMin);
+  EEPROM.put(1 + sizeof(sensorMin), sensorMax);
+
+  if (DEBUG_MODE) {
+    Serial.println("Calibration complete and saved!");
+    for(int i=0; i<NUM_SENSORS; i++){
+      Serial.print("S"); Serial.print(i);
+      Serial.print(": Min="); Serial.print(sensorMin[i]);
+      Serial.print(" Max="); Serial.println(sensorMax[i]);
+    }
+  }
+}
+
+// ----------------- MOTOR CONTROL WRAPPERS -----------------
+/**
+ * @brief Controls a single motor with speed and direction.
+ * @param motorNum 1 for Left, 2 for Right.
+ * @param speed -255 to 255. Positive for forward, negative for backward.
+ */
+void runMotor(int motorNum, int speed) {
+  bool isLeft = (motorNum == 1);
+  bool invert = isLeft ? INVERT_LEFT_MOTOR : INVERT_RIGHT_MOTOR;
+  
+  if (invert) {
+    speed = -speed;
+  }
+
+  speed = constrain(speed, -MAX_SPEED, MAX_SPEED);
+
+  if (speed >= 0) {
+    m.motor(motorNum, FORWARD, speed);
+  } else {
+    m.motor(motorNum, BACKWARD, -speed);
+  }
+}
+
+void stopMotors() {
+  m.motor(1, BRAKE, 0);
+  m.motor(2, BRAKE, 0);
+}
